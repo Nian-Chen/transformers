@@ -14,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch OpenAI GPT-2 model."""
-
+from pdb import set_trace
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
+import torch.nn.functional as F
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -847,7 +847,9 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         super().__init__(config)
         self.transformer = GPT2Model(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
+        self.sos_id = self.config.bos_token_id
+        self.eos_id = self.config.eos_token_id
+        # self.pred_pseudo_head = nn.Linear(config.n_embd, 1, bias=False)
         self.init_weights()
 
         # Model parallel
@@ -915,6 +917,140 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         output_type=CausalLMOutputWithCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
+##################################
+    def LabelSmoothingLoss(
+        self,
+        logits,
+        labels,
+        smoothing:float = 0.1,
+        padding_idx:int = -100,
+        vocab_size:int = 32,
+        normalize_length:bool = False,
+        decoder_teacher_logits = None,
+        pseudo_rows = None,
+        decoder_entropy_loss = False,
+        negative_sampling_loss = False ,
+        negative_sampling_loss_add =False,
+        reduction = 'sum',
+    ):
+        # print("doing label smoothing")
+        criterion = nn.KLDivLoss(reduction="none")
+        confidence = 1.0 - smoothing
+        assert logits.size(2) == vocab_size
+        batch_size = logits.size(0)
+        logits = logits.view(-1, vocab_size)
+        original_labels = labels
+        labels= labels.view(-1)
+        true_dist = torch.zeros_like(logits)
+        # 先用0.1/(32-1)填满，再将对应的标签位置为0.9
+        true_dist.fill_(smoothing / (vocab_size - 1))
+        # padding_index=-100用0代替，否则计算loss会报错，选用0是因为它在labels中并不会出现
+        ignore = labels == padding_idx  # (B,)
+        # 默认loss为sum/batch_size，若normalize_length = True则sum/tokens
+        total = len(labels) - ignore.sum().item()
+        labels = labels.masked_fill(ignore, 0)  # avoid -1 index
+        true_dist.scatter_(1, labels.unsqueeze(1),confidence)
+        # print(logits.shape)
+        # print(true_dist.shape)
+        # print(f"pseudo_rows in kl_loss = {pseudo_rows}")
+        # print(pseudo_rows)
+        pseudo_labels_mask = torch.zeros_like(original_labels).bool()
+        pseudo_labels_mask[pseudo_rows] = True
+        pseudo_labels_mask = pseudo_labels_mask.view(-1)
+        pseudo_weight = None
+        true_label_weight = 1.0
+        # pseudo_weight = 10.0
+        if (decoder_teacher_logits is None and decoder_entropy_loss is False and negative_sampling_loss is False):
+            # 正常计算loss或者不存在伪标签
+            kl = criterion(torch.log_softmax(logits, dim=-1), true_dist).masked_fill(ignore.unsqueeze(1), 0)#.sum()
+            #################分配伪标签权重：
+            if pseudo_weight != None:
+                # print(f"kl = {kl.sum()}")
+                kl_weight_true = kl.masked_fill((~pseudo_labels_mask).unsqueeze(1), true_label_weight)
+                kl_weight_pseudo = kl_weight_true.masked_fill((pseudo_labels_mask).unsqueeze(1), pseudo_weight)
+                kl = (kl_weight_pseudo * kl).sum()
+                # print(f"kl after weighted= {kl}")
+                return kl
+            else:
+                # print(kl)
+                if reduction == "mean":
+                    return kl.sum()/total
+                return kl.sum()
+        else:
+            # print(f"pseudo_labels_mask = {pseudo_labels_mask}")
+            # print(f"pseudo_labels_mask.shape = {pseudo_labels_mask.shape}")
+            if decoder_teacher_logits:
+                decoder_teacher_logits = decoder_teacher_logits.view(-1, vocab_size)
+                assert decoder_teacher_logits.shape==logits.shape# and (decoder_teacher_logits!=logits).sum()!=0
+            # 得到的kl loss是二维的，所以mask需要unsqueeze(1)
+            # print((~pseudo_labels_mask).sum())
+            if (~pseudo_labels_mask).sum() == 0:
+                # print("all labels are pseudo_labels")
+                # 全为伪标签，则全计算soft loss
+                if decoder_entropy_loss:
+                    # 伪标签数据计算熵值，使熵最小化
+                    logits_onehot = F.softmax((logits/1e-2),dim=-1)
+                    # print(logits_onehot)
+                    # print(logits_onehot.sum())
+                    kl_soft = criterion(torch.log_softmax(logits, dim=-1), logits_onehot)*0.1
+                    # print(kl_soft.sum())
+                    # logits_onehot中温度设置太小会导致nan
+                    print("kl_soft = 0") if kl_soft.sum()==0 else None
+                elif decoder_teacher_logits:
+                    kl_soft = criterion(torch.log_softmax(logits, dim=-1), torch.softmax(decoder_teacher_logits, dim=-1))
+                elif negative_sampling_loss:
+                    # 在原来klloss基础上加
+                    kl_all = criterion(torch.log_softmax(logits, dim=-1), true_dist).masked_fill(ignore.unsqueeze(1), 0).sum()
+                    # 只求和每个token输出中较低log概率，越小越好
+                    probs = torch.softmax(logits, dim=-1)
+                    # [[0.98,0.01,0.01],[0.51,0.42,0.03]]
+                    threshold = 0.001
+                    negative_mask = probs > threshold
+                    # [[1,0,0],[1,1,0]
+                    probs = 1.0 - probs.masked_fill(negative_mask,0).sum(-1)
+                    # [1,1] - [0.02,0.03] = [0.98,0.97]
+                    probs = probs.masked_fill(ignore, 1)
+                    # print(f"probs = {probs}")
+                    # 用1来mask，因为接下来要算log，1对应log为0，则不影响
+                    negative_sampling_loss = -probs.log().sum()
+                    # print(f"negative_sampling_loss = {negative_sampling_loss}")
+                    return negative_sampling_loss + kl_all
+                return kl_soft.masked_fill(ignore.unsqueeze(1), 0).sum()
+            else:
+                # 对于伪标注数据，是否使用最小化熵loss
+                # batch不全为伪标签样本
+                # print("has both true_labels and pseudo_labels")
+                # print(f"pseudo_rows in kl_loss = {pseudo_rows}")
+                kl_all = criterion(torch.log_softmax(logits, dim=-1), true_dist).masked_fill(ignore.unsqueeze(1), 0).sum()
+                # kl_hard = criterion(torch.log_softmax(logits, dim=-1), true_dist).masked_fill(pseudo_labels_mask.unsqueeze(1), 0).masked_fill(ignore.unsqueeze(1), 0).sum()
+                # print(f"kl_hard.sum() = {kl_hard.sum()}")
+                if decoder_entropy_loss:
+                    logits_onehot = F.softmax((logits/1e-2),dim=-1)
+                    kl_soft = criterion(torch.log_softmax(logits, dim=-1), logits_onehot).masked_fill((~pseudo_labels_mask).unsqueeze(1), 0)*0.1
+                    print("kl_soft = 0") if kl_soft.sum()==0 else None
+                    # print(kl_soft.sum())
+                elif decoder_teacher_logits:
+                    kl_soft = criterion(torch.log_softmax(logits, dim=-1), torch.softmax(decoder_teacher_logits, dim=-1)).masked_fill((~pseudo_labels_mask).unsqueeze(1), 0)
+                elif negative_sampling_loss:
+                    # 只求和每个token输出中较低概率，然后用1向量减去它，取-log
+                    probs = torch.softmax(logits, dim=-1)
+                    # [[0.98,0.01,0.01],[0.51,0.42,0.03]]
+                    threshold = 0.001
+                    negative_mask = probs > threshold
+                    # [[1,0,0],[1,1,0]
+                    probs = 1.0 - probs.masked_fill(negative_mask,0).sum(-1)
+                    # [1,1] - [0.02,0.03] = [0.98,0.97]
+                    probs = probs.masked_fill(ignore, 1)#.masked_fill(~pseudo_labels_mask, 1)
+                    # print(f"probs = {probs}")
+                    # 用1来mask，因为接下来要算log，1对应log为0，则不影响
+                    negative_sampling_loss = -probs.log().sum()
+                    # print(f"negative_sampling_loss = {negative_sampling_loss}")
+                    return kl_all + negative_sampling_loss
+                kl = kl_hard+kl_soft
+                return kl.masked_fill(ignore.unsqueeze(1), 0).sum()
+        # denom = total if normalize_length else batch_size
+        # 返回sum
+        return kl
     def forward(
         self,
         input_ids=None,
@@ -931,6 +1067,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        decoder_teacher_logits=None,
+        pseudo_rows = None,
+        decoder_entropy_loss = False,
+        vocab_size = 32,
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -963,16 +1103,80 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
         lm_logits = self.lm_head(hidden_states)
-
+        do_label_smoothing = True
         loss = None
+        lsm_reduction = "sum" if self.config.add_cross_attention else "mean"
         if labels is not None:
-            # Shift so that tokens < n predict n
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
+            if decoder_teacher_logits is not None:
+                decoder_teacher_logits = decoder_teacher_logits[..., :-1, :].contiguous()
+            if do_label_smoothing:
+                loss = self.LabelSmoothingLoss(logits = shift_logits,
+                                               labels = shift_labels,
+                                               smoothing = 0.1,
+                                               padding_idx = -100,
+                                               vocab_size = vocab_size,
+                                               decoder_teacher_logits = decoder_teacher_logits,
+                                               pseudo_rows = pseudo_rows,
+                                               reduction = lsm_reduction,
+                                               decoder_entropy_loss = decoder_entropy_loss)
+                # loss = self.LabelSmoothingLoss(logits = shift_logits,
+                                               # labels = shift_labels,
+                                               # smoothing = 0.1,
+                                               # padding_idx = -100,
+                                               # vocab_size = 50257,
+                                               # decoder_teacher_logits = decoder_teacher_logits,
+                                               # pseudo_rows = pseudo_rows,
+                                               # reduction = 'mean',
+                                               # decoder_entropy_loss = decoder_entropy_loss)
+                # print(loss.item())
+            else:
+                # Shift so that tokens < n predict n
+                shift_logits = lm_logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                # Flatten the tokens
+    ###########################################
+                 # labels被shift，那么redution="mean"求取的并非batch mean，而是token mean，故与wav2vec2保持一致，此步返回sum
+                loss_fct = CrossEntropyLoss(reduction='mean')
+                # gpt2微调计算loss时没考虑pad，因为labels是等长的（拼接到block_size）
+                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                # nan_mask = torch.isnan(loss)  
+                # if sum(nan_mask) > 0:
+                    # print(hidden_states)
+                    # print(lm_logits)
+                    # print(attention_mask)
+                    # print(encoder_attention_mask)
+                    # print(labels)
+                    # if sum(~nan_mask) == 0:
+                        # print("!"*20,"cross_entopy_loss all is nan","!"*20)
+                        # loss = torch.tensor(0.0,requires_grad=True)
+                    # else:
+                        # print("!"*20,"cross_entopy_loss has nan","!"*20)
+                        # loss = loss.masked_select(~nan_mask).sum()
+                    # print(loss)
+                    # print(torch.isnan(loss))
+                # else:
+                    # loss = loss.sum()
+            do_predict_pseudo = False
+            if do_predict_pseudo:
+                set_trace()
+                eos_index = (labels==self.eos_id).nonzero()
+                eos_index = eos_index.transpose(0,1).tolist()
+                # 取出eos对应的hidden_states
+                logits_eos = hidden_states[eos_index].contiguous()
+                pred_pseudo_loss_func = nn.BCELoss(reduction='sum')
+                sigmoid = nn.Sigmoid()
+                pred_pseudo_probs = sigmoid(self.pred_pseudo_head(logits_eos)).squeeze(1)
+                pred_pseudo_targets = torch.ones(labels.shape[0])
+                # 0-1可代表置信度，真实标签置信度为1
+                pred_pseudo_targets[pseudo_rows] = 0
+                pred_pseudo_loss = pred_pseudo_loss_func(pred_pseudo_probs,pred_pseudo_targets)
+                # 由它们预测样本是否为伪标注
+                loss = loss + pred_pseudo_loss
+                output = (lm_logits,) + transformer_outputs[1:]
+                return ((loss,) + output) if loss is not None else output
+                
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
