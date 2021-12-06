@@ -255,7 +255,6 @@ def speed_metrics(split, start_time, num_samples=None, num_steps=None):
         result[f"{split}_steps_per_second"] = round(steps_per_second, 3)
     return result
 
-
 class SchedulerType(ExplicitEnum):
     LINEAR = "linear"
     COSINE = "cosine"
